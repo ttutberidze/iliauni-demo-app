@@ -10,7 +10,7 @@
   "taskRoleArn": "arn:aws:iam::425210931122:role/ecsTaskRoleDemo",
   "containerDefinitions": [
     {
-      "name": "app",
+      "name": "iliauni-demo-app",
       "image": "<IMAGE_URI>",
       "essential": true,
       "portMappings": [
