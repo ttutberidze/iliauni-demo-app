@@ -1,5 +1,5 @@
 {
-  "family": "ecs-rds-gha-demo",
+  "family": "iliauni-demo-app",
   "networkMode": "awsvpc",
   "requiresCompatibilities": [
     "FARGATE"
@@ -52,7 +52,7 @@
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-          "awslogs-group": "/ecs/ecs-rds-gha-demo",
+          "awslogs-group": "/ecs/iliauni-demo-app",
           "awslogs-region": "eu-west-2",
           "awslogs-stream-prefix": "ecs"
         }
