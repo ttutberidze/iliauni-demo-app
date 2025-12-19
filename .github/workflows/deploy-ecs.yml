@@ -42,18 +42,97 @@ jobs:
           docker build -t $REGISTRY/${ECR_REPOSITORY}:$IMAGE_TAG ./app
           docker push $REGISTRY/${ECR_REPOSITORY}:$IMAGE_TAG
 
-      - name: Render ECS task definition (inject new image)
-        id: render-task
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: ecs/task-definition.json
-          container-name: app
-          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+      - name: Get current task definition from running service
+        id: get-task-def
+        run: |
+          # Get the task definition ARN from the service
+          TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          
+          echo "Current task definition: $TASK_DEF_ARN"
+          echo "task-def-arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+          
+          # Extract family name from ARN (format: arn:aws:ecs:region:account:task-definition/family:revision)
+          TASK_DEF_FAMILY=$(echo $TASK_DEF_ARN | awk -F'/' '{print $2}' | awk -F':' '{print $1}')
+          echo "task-def-family=$TASK_DEF_FAMILY" >> $GITHUB_OUTPUT
+
+      - name: Get and update task definition
+        id: update-task-def
+        env:
+          NEW_IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          # Get the current task definition JSON
+          aws ecs describe-task-definition \
+            --task-definition ${{ steps.get-task-def.outputs.task-def-arn }} \
+            --query 'taskDefinition' > task-definition.json
+          
+          # Find the container index that matches our ECR repository
+          # This updates the container whose image is from the same ECR repository
+          REGISTRY_BASE=$(echo "$NEW_IMAGE" | cut -d'/' -f1)
+          REPO_NAME=$(echo "$NEW_IMAGE" | cut -d'/' -f2 | cut -d':' -f1)
+          
+          # Try to find container by matching ECR repository in current image
+          CONTAINER_INDEX=0
+          CONTAINER_COUNT=$(cat task-definition.json | jq '.containerDefinitions | length')
+          
+          for i in $(seq 0 $((CONTAINER_COUNT - 1))); do
+            CURRENT_IMAGE=$(cat task-definition.json | jq -r ".containerDefinitions[$i].image")
+            if echo "$CURRENT_IMAGE" | grep -q "$REPO_NAME"; then
+              CONTAINER_INDEX=$i
+              break
+            fi
+          done
+          
+          CONTAINER_NAME=$(cat task-definition.json | jq -r ".containerDefinitions[$CONTAINER_INDEX].name")
+          echo "Updating container: $CONTAINER_NAME (index: $CONTAINER_INDEX)"
+          echo "container-name=$CONTAINER_NAME" >> $GITHUB_OUTPUT
+          
+          # Update the image for the matching container
+          jq --arg IMAGE "$NEW_IMAGE" --argjson INDEX $CONTAINER_INDEX \
+            '.containerDefinitions[$INDEX].image = $IMAGE' \
+            task-definition.json > task-definition-updated.json
+          
+          # Update GIT_SHA environment variable (update if exists, add if not)
+          GIT_SHA="${{ github.sha }}"
+          # Use jq to update or add GIT_SHA in one operation
+          jq --arg GIT_SHA "$GIT_SHA" --argjson INDEX $CONTAINER_INDEX \
+            '.containerDefinitions[$INDEX].environment = (
+              (.containerDefinitions[$INDEX].environment // []) | 
+              if (map(.name) | index("GIT_SHA")) != null then
+                map(if .name == "GIT_SHA" then .value = $GIT_SHA else . end)
+              else
+                . + [{"name": "GIT_SHA", "value": $GIT_SHA}]
+              end
+            )' \
+            task-definition-updated.json > task-definition-with-sha.json
+          
+          # Remove fields that shouldn't be in the new task definition
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-definition-with-sha.json > task-definition-final.json
+          
+          # Save the updated task definition for debugging
+          echo "Updated task definition:"
+          cat task-definition-final.json
+
+      - name: Register new task definition
+        id: register-task-def
+        run: |
+          # Register the new task definition
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition-final.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "New task definition ARN: $NEW_TASK_DEF_ARN"
+          echo "task-definition-arn=$NEW_TASK_DEF_ARN" >> $GITHUB_OUTPUT
 
       - name: Deploy to ECS service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
-          task-definition: ${{ steps.render-task.outputs.task-definition }}
+          task-definition: task-definition-final.json
           service: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
